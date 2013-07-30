@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 LOCAL_PATH := $(call my-dir)
-
+ifneq ($(WPA_SUPPLICANT_VERSION),VER_0_8_UNITE)
 ########################
 
 include $(CLEAR_VARS)
@@ -26,4 +26,4 @@ LOCAL_SRC_FILES := android_dhcpcd.conf
 include $(BUILD_PREBUILT)
 
 ########################
-
+endif
