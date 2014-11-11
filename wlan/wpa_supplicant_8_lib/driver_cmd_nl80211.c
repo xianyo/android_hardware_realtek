@@ -37,6 +37,27 @@ static void wpa_driver_send_hang_msg(struct wpa_driver_nl80211_data *drv)
 	}
 }
 
+static void wpa_driver_notify_country_change(void *ctx, char *cmd)
+{
+	if ((os_strncasecmp(cmd, "COUNTRY", 7) == 0) ||
+	    (os_strncasecmp(cmd, "SETBAND", 7) == 0)) {
+		union wpa_event_data event;
+
+		os_memset(&event, 0, sizeof(event));
+		event.channel_list_changed.initiator = REGDOM_SET_BY_USER;
+		if (os_strncasecmp(cmd, "COUNTRY", 7) == 0) {
+			event.channel_list_changed.type = REGDOM_TYPE_COUNTRY;
+			if (os_strlen(cmd) > 9) {
+				event.channel_list_changed.alpha2[0] = cmd[8];
+				event.channel_list_changed.alpha2[1] = cmd[9];
+			}
+		} else {
+			event.channel_list_changed.type = REGDOM_TYPE_UNKNOWN;
+		}
+		wpa_supplicant_event(ctx, EVENT_CHANNEL_LIST_CHANGED, &event);
+	}
+}
+
 int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 				  size_t buf_len )
 {
@@ -60,32 +81,35 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 			ret = os_snprintf(buf, buf_len,
 					  "Macaddr = " MACSTR "\n", MAC2STR(macaddr));
 	} else { /* Use private command */
-		os_memcpy(buf, cmd, strlen(cmd) + 1);
 		memset(&ifr, 0, sizeof(ifr));
 		memset(&priv_cmd, 0, sizeof(priv_cmd));
+		os_memcpy(buf, cmd, strlen(cmd) + 1);
 		os_strlcpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
 
 		priv_cmd.buf = buf;
 		priv_cmd.used_len = buf_len;
 		priv_cmd.total_len = buf_len;
-		ifr.ifr_data = (void *)&priv_cmd;
+		ifr.ifr_data = &priv_cmd;
 
 		if ((ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr)) < 0) {
 			wpa_printf(MSG_ERROR, "%s: failed to issue private commands\n", __func__);
-			wpa_driver_send_hang_msg(drv);
 		} else {
 			drv_errors = 0;
 			ret = 0;
 			if ((os_strcasecmp(cmd, "LINKSPEED") == 0) ||
 			    (os_strcasecmp(cmd, "RSSI") == 0) ||
-			    (os_strcasecmp(cmd, "GETBAND") == 0) ||
-			    (os_strncasecmp(cmd, "WLS_BATCHING", 12) == 0))
+			    (os_strcasecmp(cmd, "GETBAND") == 0) )
 				ret = strlen(buf);
-			else if ((os_strncasecmp(cmd, "COUNTRY", 7) == 0) ||
-				 (os_strncasecmp(cmd, "SETBAND", 7) == 0))
-				wpa_supplicant_event(drv->ctx,
-					EVENT_CHANNEL_LIST_CHANGED, NULL);
-			wpa_printf(MSG_DEBUG, "%s %s len = %d, %d", __func__, buf, ret, strlen(buf));
+			else if (os_strcasecmp(cmd, "P2P_DEV_ADDR") == 0)
+				wpa_printf(MSG_DEBUG, "%s: P2P: Device address ("MACSTR")",
+					__func__, MAC2STR(buf));
+			else if (os_strcasecmp(cmd, "P2P_SET_PS") == 0)
+				wpa_printf(MSG_DEBUG, "%s: P2P: %s ", __func__, buf);
+			else if (os_strcasecmp(cmd, "P2P_SET_NOA") == 0)
+				wpa_printf(MSG_DEBUG, "%s: P2P: %s ", __func__, buf);
+			else
+				wpa_printf(MSG_DEBUG, "%s %s len = %d, %d", __func__, buf, ret, strlen(buf));
+			wpa_driver_notify_country_change(drv->ctx, cmd);
 		}
 	}
 	return ret;
