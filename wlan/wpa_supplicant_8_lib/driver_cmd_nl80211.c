@@ -11,17 +11,21 @@
  *
  */
 
-#include "driver_nl80211.h"
+#include <sys/cdefs.h>
+#include "hardware_legacy/driver_nl80211.h"
 #include "wpa_supplicant_i.h"
 #include "config.h"
 #ifdef ANDROID
 #include "android_drv.h"
 #endif
 
-#define MAX_WPSP2PIE_CMD_SIZE		512
 
 typedef struct android_wifi_priv_cmd {
-	char *buf;
+#ifdef BCMDHD_64_BIT_IPC
+	u64 bufaddr;
+#else
+	char *bufaddr;
+#endif
 	int used_len;
 	int total_len;
 } android_wifi_priv_cmd;
@@ -67,6 +71,23 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 	android_wifi_priv_cmd priv_cmd;
 	int ret = 0;
 
+	if (bss->ifindex <= 0 && bss->wdev_id > 0) {
+		/* DRIVER CMD received on the DEDICATED P2P Interface which doesn't
+		 * have an NETDEVICE associated with it. So we have to re-route the
+		 * command to the parent NETDEVICE
+		 */
+		struct wpa_supplicant *wpa_s = (struct wpa_supplicant *)(drv->ctx);
+
+		wpa_printf(MSG_DEBUG, "Re-routing DRIVER cmd to parent iface");
+		if (wpa_s && wpa_s->parent) {
+			/* Update the nl80211 pointers corresponding to parent iface */
+			bss = wpa_s->parent->drv_priv;
+			drv = bss->drv;
+			wpa_printf(MSG_DEBUG, "Re-routing command to iface: %s"
+					      " cmd (%s)", bss->ifname, cmd);
+		}
+	}
+
 	if (os_strcasecmp(cmd, "STOP") == 0) {
 		linux_set_iface_flags(drv->global->ioctl_sock, bss->ifname, 0);
 		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STOPPED");
@@ -81,35 +102,33 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 			ret = os_snprintf(buf, buf_len,
 					  "Macaddr = " MACSTR "\n", MAC2STR(macaddr));
 	} else { /* Use private command */
+		os_memcpy(buf, cmd, strlen(cmd) + 1);
 		memset(&ifr, 0, sizeof(ifr));
 		memset(&priv_cmd, 0, sizeof(priv_cmd));
-		os_memcpy(buf, cmd, strlen(cmd) + 1);
 		os_strlcpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
 
-		priv_cmd.buf = buf;
+#ifdef BCMDHD_64_BIT_IPC
+		priv_cmd.bufaddr = (u64)(uintptr_t)buf;
+#else
+		priv_cmd.bufaddr = buf;
+#endif
 		priv_cmd.used_len = buf_len;
 		priv_cmd.total_len = buf_len;
 		ifr.ifr_data = &priv_cmd;
 
 		if ((ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr)) < 0) {
-			wpa_printf(MSG_ERROR, "%s: failed to issue private commands\n", __func__);
+			wpa_printf(MSG_ERROR, "%s: failed to issue private command: %s", __func__, cmd);
+			wpa_driver_send_hang_msg(drv);
 		} else {
 			drv_errors = 0;
 			ret = 0;
 			if ((os_strcasecmp(cmd, "LINKSPEED") == 0) ||
 			    (os_strcasecmp(cmd, "RSSI") == 0) ||
-			    (os_strcasecmp(cmd, "GETBAND") == 0) )
+			    (os_strcasecmp(cmd, "GETBAND") == 0) ||
+			    (os_strncasecmp(cmd, "WLS_BATCHING", 12) == 0))
 				ret = strlen(buf);
-			else if (os_strcasecmp(cmd, "P2P_DEV_ADDR") == 0)
-				wpa_printf(MSG_DEBUG, "%s: P2P: Device address ("MACSTR")",
-					__func__, MAC2STR(buf));
-			else if (os_strcasecmp(cmd, "P2P_SET_PS") == 0)
-				wpa_printf(MSG_DEBUG, "%s: P2P: %s ", __func__, buf);
-			else if (os_strcasecmp(cmd, "P2P_SET_NOA") == 0)
-				wpa_printf(MSG_DEBUG, "%s: P2P: %s ", __func__, buf);
-			else
-				wpa_printf(MSG_DEBUG, "%s %s len = %d, %d", __func__, buf, ret, strlen(buf));
 			wpa_driver_notify_country_change(drv->ctx, cmd);
+			wpa_printf(MSG_DEBUG, "%s %s len = %d, %zu", __func__, buf, ret, strlen(buf));
 		}
 	}
 	return ret;
@@ -125,7 +144,7 @@ int wpa_driver_set_p2p_noa(void *priv, u8 count, int start, int duration)
 	return wpa_driver_nl80211_driver_cmd(priv, buf, buf, strlen(buf)+1);
 }
 
-int wpa_driver_get_p2p_noa(void __unused *priv, u8 __unused *buf, size_t __unused len)
+int wpa_driver_get_p2p_noa(void *priv __unused, u8 *buf __unused, size_t len __unused)
 {
 	/* Return 0 till we handle p2p_presence request completely in the driver */
 	return 0;
@@ -146,11 +165,12 @@ int wpa_driver_set_ap_wps_p2p_ie(void *priv, const struct wpabuf *beacon,
 				 const struct wpabuf *assocresp)
 {
 	char *buf;
-	struct wpabuf *ap_wps_p2p_ie = NULL;
+	const struct wpabuf *ap_wps_p2p_ie = NULL;
+
 	char *_cmd = "SET_AP_WPS_P2P_IE";
 	char *pbuf;
 	int ret = 0;
-	int i;
+	int i, buf_len;
 	struct cmd_desc {
 		int cmd;
 		const struct wpabuf *src;
@@ -163,41 +183,28 @@ int wpa_driver_set_ap_wps_p2p_ie(void *priv, const struct wpabuf *beacon,
 
 	wpa_printf(MSG_DEBUG, "%s: Entry", __func__);
 	for (i = 0; cmd_arr[i].cmd != -1; i++) {
-		#if 0
-		if(cmd_arr[i].src){
-		wpa_printf(MSG_INFO,	"cmd_arr[%d].src->size:%d\n"
-					"cmd_arr[%d].src->used:%d\n"
-					"cmd_arr[%d].src->ext_data:%s\n"
-					, i, cmd_arr[i].src->size
-					, i, cmd_arr[i].src->used
-					, i, cmd_arr[i].src->ext_data
-		);
-		}
-		#endif
-
-		ap_wps_p2p_ie = cmd_arr[i].src ?
-			wpabuf_dup(cmd_arr[i].src) : NULL;
+		ap_wps_p2p_ie = cmd_arr[i].src;
 		if (ap_wps_p2p_ie) {
-			buf = os_zalloc(strlen(_cmd) + 3 + wpabuf_len(ap_wps_p2p_ie));
-			if(buf) {
-				pbuf = buf;
-				pbuf += sprintf(pbuf, "%s %d", _cmd, cmd_arr[i].cmd);
-				*pbuf++ = '\0';
-
-				os_memcpy(pbuf, wpabuf_head(ap_wps_p2p_ie), wpabuf_len(ap_wps_p2p_ie));
-				ret = wpa_driver_nl80211_driver_cmd(priv, buf, buf,
-					strlen(_cmd) + 3 + wpabuf_len(ap_wps_p2p_ie));
-
-				os_free(buf);				
-			} else {
-				wpa_printf(MSG_ERROR, "%s: os_zalloc fail", __func__);
+			buf_len = strlen(_cmd) + 3 + wpabuf_len(ap_wps_p2p_ie);
+			buf = os_zalloc(buf_len);
+			if (NULL == buf) {
+				wpa_printf(MSG_ERROR, "%s: Out of memory",
+					   __func__);
 				ret = -1;
-			}
-
-			wpabuf_free(ap_wps_p2p_ie);
-			if (ret < 0)
 				break;
+			}
+		} else {
+			continue;
 		}
+		pbuf = buf;
+		pbuf += snprintf(pbuf, buf_len - wpabuf_len(ap_wps_p2p_ie),
+				 "%s %d",_cmd, cmd_arr[i].cmd);
+		*pbuf++ = '\0';
+		os_memcpy(pbuf, wpabuf_head(ap_wps_p2p_ie), wpabuf_len(ap_wps_p2p_ie));
+		ret = wpa_driver_nl80211_driver_cmd(priv, buf, buf, buf_len);
+		os_free(buf);
+		if (ret < 0)
+			break;
 	}
 
 	return ret;
